@@ -4,7 +4,7 @@ import re
 import html
 import altair as alt
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
 
 st.set_page_config(page_title="우리학교 다이어트 지키미", page_icon="🍱")
 
@@ -87,10 +87,18 @@ def is_kimchi_or_rice(dish):
 
 PASTEL = ["#FFB5C2", "#FFD6A5", "#FDEBA0", "#B9E8C4", "#A8DDF0", "#B8C6F5", "#D4BDF5"]
 
-def pastel_bar(data, unit=""):
+NUTRIENT_COLORS = {"탄수화물": "#FFD59E", "단백질": "#F6A5A5", "지방": "#BFE3C4"}  # 살구·장미·연민트 (게이지·운동 색과 어울리는 톤, 의미 고정)
+
+def blend(c1, c2, t):
+    """두 #RRGGBB 색 사이를 t(0~1)만큼 섞는다"""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+def pastel_bar(data, unit="", colors=None):
     """{이름: 값} 딕셔너리를 파스텔 색 가로 막대그래프로 표시"""
     d = pd.DataFrame({"이름": list(data.keys()), "값": list(data.values())})
-    d["색"] = [PASTEL[i % len(PASTEL)] for i in range(len(d))]
+    d["색"] = colors or [PASTEL[i % len(PASTEL)] for i in range(len(d))]
     bars = alt.Chart(d, height=alt.Step(34)).mark_bar(
         cornerRadiusTopRight=8, cornerRadiusBottomRight=8
     ).encode(
@@ -112,7 +120,7 @@ GEMINI_MODELS = [
     ("gemini-3.5-flash", "minimal"),
 ]
 
-def ask_trainer(system_prompt, history):
+def ask_trainer(system_prompt, history, profile_note=""):
     """Gemini REST API 호출. 모델이 혼잡하면 다음 모델로 넘어간다."""
     if not GEMINI_API_KEY:
         return "GEMINI_API_KEY가 설정되지 않았어요. .streamlit/secrets.toml을 확인해 주세요."
@@ -123,6 +131,9 @@ def ask_trainer(system_prompt, history):
             for m in history
         ],
     }
+    if profile_note:  # 이전 대화와 값이 달라도 가장 최신 정보를 기준으로 답하도록 마지막 말에 덧붙인다
+        last = body["contents"][-1]["parts"][0]
+        last["text"] += f"\n\n{profile_note} (이전 대화보다 이 값이 최신이야)"
     last_error = ""
     for model, level in GEMINI_MODELS:
         body["generationConfig"] = {"thinkingConfig": {"thinkingLevel": level}}
@@ -149,6 +160,56 @@ def format_reply(text):
         text = re.sub(r"(?<=[.!?])\s+", "\n", text)
     return re.sub(r"\n+", "\n\n", text)
 
+WEEKLY_GOAL = round(DAILY_KCAL / 3 * 5)  # 점심 한 끼(하루의 1/3) x 5일
+
+def week_kcal(df, view_date):
+    """view_date가 속한 주의 월~금 중식 칼로리 (view_date까지만 누적, 급식 없는 날은 None)"""
+    monday = view_date - timedelta(days=view_date.weekday())
+    result = []
+    for i in range(5):
+        d = monday + timedelta(days=i)
+        row = df[df["MLSV_YMD"] == d.strftime("%Y%m%d")]
+        result.append(float(row["칼로리"].iloc[0]) if d <= view_date and not row.empty else None)
+    return result
+
+def pig_gauge(week):
+    """이번 주 돼지력 게이지: 요일별 칼로리가 한 막대에 차례로 쌓인다"""
+    total = sum(k for k in week if k)
+    pct = total / WEEKLY_GOAL * 100
+    if pct < 50:
+        msg = "아직 여유로워요 😌"
+    elif pct < 80:
+        msg = "슬슬 조심해요 🤔"
+    elif pct < 100:
+        msg = "아슬아슬해요! 😰"
+    else:
+        msg = "돼지력 폭발! 🐷💥"
+    scale = max(total, WEEKLY_GOAL)  # 넘치면 전체를 100% 폭에 맞춰 보여줌
+    segs, legend = "", ""
+    for i, k in enumerate(week):
+        color = blend("#FFE0BF", "#FF8E7A", i / 4)  # 월(연한 살구) → 금(진한 산호)
+        if k:
+            segs += f'<div title="{WEEKDAYS[i]} {k:.0f} Kcal" style="width:{k / scale * 100:.2f}%;background:{color};"></div>'
+        legend += (
+            f'<span style="margin-right:14px;white-space:nowrap;">'
+            f'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{color};margin-right:4px;"></span>'
+            f'{WEEKDAYS[i]} {f"{k:.0f}" if k else "-"}</span>'
+        )
+    bar_color = "rgba(128,128,128,0.18)"
+    over = "box-shadow:0 0 0 2px #FF4B4B inset;" if pct >= 100 else ""
+    with st.container(border=True):
+        st.markdown(
+            f'<div style="font-size:0.9rem;opacity:0.7;">🐷 이번 주 돼지력</div>'
+            f'<div style="font-size:1.8rem;font-weight:700;line-height:1.3;">{pct:.0f}%'
+            f'<span style="font-size:0.9rem;font-weight:400;opacity:0.7;"> {total:,.0f} / {WEEKLY_GOAL:,} Kcal · {msg}</span></div>'
+            f'<div style="display:flex;height:26px;border-radius:13px;overflow:hidden;background:{bar_color};margin:8px 0 10px;{over}">{segs}</div>'
+            f'<div style="font-size:0.85rem;">{legend}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"※ 기준 {WEEKLY_GOAL:,} Kcal = 하루 권장 열량 {DAILY_KCAL:,} Kcal(가정값)의 1/3(점심 한 끼) × 5일"
+        )
+
 def stat_card(container, title, value, unit="", note=None):
     """제목·수치·단위·보조설명의 글씨 크기를 통일한 카드"""
     with container.container(border=True):
@@ -160,6 +221,35 @@ def stat_card(container, title, value, unit="", note=None):
         )
         if note:
             st.caption(note)
+
+def remember(key):
+    """위젯 값을 'keep_키'에 따로 저장하는 콜백. 위젯이 화면에서 사라져도 값이 남는다."""
+    def _save():
+        st.session_state["keep_" + key] = st.session_state[key]
+    return _save
+
+def body_inputs():
+    """키·몸무게 슬라이더 + BMI 카드 (첫 화면과 트레이너 화면에서 같이 사용)"""
+    col_h, col_w, col_b = st.columns(3)
+    height = col_h.slider(
+        "키 (cm)", min_value=130, max_value=210, step=1,
+        value=st.session_state["keep_height"], key="height", on_change=remember("height"),
+    )
+    weight = col_w.slider(
+        "몸무게 (kg)", min_value=30, max_value=150, step=1,
+        value=st.session_state["keep_weight"], key="weight", on_change=remember("weight"),
+    )
+    bmi = weight / (height / 100) ** 2
+    if bmi < 18.5:
+        bmi_label = "저체중"
+    elif bmi < 23:
+        bmi_label = "정상"
+    elif bmi < 25:
+        bmi_label = "과체중"
+    else:
+        bmi_label = "비만"
+    stat_card(col_b, "📏 내 BMI", f"{bmi:.1f}", f"({bmi_label})")
+    return height, weight, bmi
 
 def clean_dish_name(dish):
     dish = re.sub(r"[\(\[].*?[\)\]]", "", dish)
@@ -176,6 +266,8 @@ year = today.year if today >= date(today.year, 3, 2) else today.year - 1
 start = f"{year}0302"
 end = today.strftime("%Y%m%d")
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+default_date = today - timedelta(days=max(today.weekday() - 4, 0))  # 주말이면 지난 금요일
+min_date = date(year, 3, 2)
 
 # 사이드바 메뉴 (처음 접속할 때부터 항상 표시)
 pages = ["📅 오늘의 급식", "🏆 칼로리 TOP", "🍚 우리학교 인기쟁이 메뉴", "💪 개인트레이너 잔소리"]
@@ -197,10 +289,12 @@ for p in pages:
         st.rerun()
 page = st.session_state["page"]
 
-# 다른 페이지로 이동해도 입력값이 유지되도록 복원
-for _k in ["office_name", "school_input", "height", "weight"]:
-    if _k in st.session_state:
-        st.session_state[_k] = st.session_state[_k]
+# 입력값 기본값 ('keep_' 로 시작하는 키에 따로 저장해서, 다른 화면에 다녀와도 값이 유지된다)
+for _k, _v in {
+    "office_name": "경기도교육청", "school_input": "광명고등학교",
+    "height": 170, "weight": 60, "sel_date": default_date,
+}.items():
+    st.session_state.setdefault("keep_" + _k, _v)
 
 on_top = "rows" in st.session_state and page != pages[0]
 
@@ -220,22 +314,17 @@ if not on_top:
         "제주특별자치도교육청": "T10"
     }
 
-    office_name = st.selectbox("교육청을 선택하세요", list(offices.keys()), index=8, key="office_name")
+    office_name = st.selectbox(
+        "교육청을 선택하세요", list(offices.keys()),
+        index=list(offices.keys()).index(st.session_state["keep_office_name"]),
+        key="office_name", on_change=remember("office_name"),
+    )
     office_code = offices[office_name]
-    school_name = st.text_input("학교 이름을 입력하세요", value="광명고등학교", key="school_input")
-    col_h, col_w, col_b = st.columns(3)
-    height = col_h.slider("키 (cm)", min_value=130, max_value=210, value=170, step=1, key="height")
-    weight = col_w.slider("몸무게 (kg)", min_value=30, max_value=150, value=60, step=1, key="weight")
-    bmi = weight / (height / 100) ** 2
-    if bmi < 18.5:
-        bmi_label = "저체중"
-    elif bmi < 23:
-        bmi_label = "정상"
-    elif bmi < 25:
-        bmi_label = "과체중"
-    else:
-        bmi_label = "비만"
-    stat_card(col_b, "📏 내 BMI", f"{bmi:.1f}", f"({bmi_label})")
+    school_name = st.text_input(
+        "학교 이름을 입력하세요",
+        value=st.session_state["keep_school_input"], key="school_input", on_change=remember("school_input"),
+    )
+    height, weight, bmi = body_inputs()
 
     st.caption(f"조회 기간: {start} ~ {end}")
 
@@ -281,10 +370,22 @@ if "rows" in st.session_state:
     else:
 
         if page == "📅 오늘의 급식":
-            st.header(f"📅 오늘의 급식 · {today.month}월 {today.day}일 ({WEEKDAYS[today.weekday()]})")
-            today_df = df[df["MLSV_YMD"] == end]
+            sel_date = st.date_input(
+                "🕰️ 급식 타임머신, 어느 날로 갈까요?", min_value=min_date, max_value=today,
+                value=st.session_state["keep_sel_date"], key="sel_date", on_change=remember("sel_date"),
+            )
+            sel_ymd = sel_date.strftime("%Y%m%d")
+            if sel_date == today:
+                title = "오늘의 급식"
+            else:
+                title = "급식"
+            st.header(f"📅 {title} · {sel_date.month}월 {sel_date.day}일 ({WEEKDAYS[sel_date.weekday()]})")
+
+            pig_gauge(week_kcal(df, sel_date))
+
+            today_df = df[df["MLSV_YMD"] == sel_ymd]
             if today_df.empty:
-                st.info("오늘은 중식 정보가 없습니다. (주말·휴일일 수 있어요)")
+                st.info("이 날은 중식 정보가 없습니다. (주말·휴일일 수 있어요)")
             else:
                 t = today_df.iloc[0]
                 kcal = float(t["칼로리"])
@@ -307,7 +408,7 @@ if "rows" in st.session_state:
                     macro = {k: nutrients[k] for k in ["탄수화물", "단백질", "지방"] if k in nutrients}
                     if macro:
                         st.markdown("##### 🥗 영양소 (g)")
-                        pastel_bar(macro, "g")
+                        pastel_bar(macro, "g", colors=[NUTRIENT_COLORS[k] for k in macro])
 
                 # 오른쪽: 총 칼로리 카드
                 stat_card(
@@ -331,7 +432,12 @@ if "rows" in st.session_state:
                     kcal_per_min = met * 3.5 * weight / 200
                     minutes[name] = round(kcal / kcal_per_min)
                     stat_card(col, name, f"{minutes[name]}", "분")
-                pastel_bar(minutes, "필요 시간 (분)")
+                lo_m, hi_m = min(minutes.values()), max(minutes.values())
+                ex_colors = [
+                    blend("#CFEFDD", "#4DB38A", (v - lo_m) / (hi_m - lo_m) if hi_m > lo_m else 1)
+                    for v in minutes.values()
+                ]
+                pastel_bar(minutes, "필요 시간 (분)", colors=ex_colors)
 
         elif page == pages[1]:
             st.header("🏆 칼로리 TOP (중식 기준)")
@@ -425,18 +531,19 @@ if "rows" in st.session_state:
 
         else:
             st.header("💪 개인트레이너 잔소리")
-            today_df = df[df["MLSV_YMD"] == end]
+            view_date = st.session_state["keep_sel_date"]
+            today_df = df[df["MLSV_YMD"] == view_date.strftime("%Y%m%d")]
+            week_total = sum(k for k in week_kcal(df, view_date) if k)
             if today_df.empty:
-                st.info("오늘은 중식 정보가 없어서 잔소리할 거리가 없어요. (주말·휴일일 수 있어요)")
+                st.info("이 날은 중식 정보가 없어서 잔소리할 거리가 없어요. (주말·휴일일 수 있어요)")
                 st.stop()
 
             t = today_df.iloc[0]
             kcal = float(t["칼로리"])
             menu = ", ".join(clean_menu(t["DDISH_NM"]))
             nutrients = parse_nutrients(t.get("NTR_INFO"))
-            h = st.session_state.get("height", 170)
-            w = st.session_state.get("weight", 60)
-            bmi_v = w / (h / 100) ** 2
+            h, w, bmi_v = body_inputs()  # 여기서 바꾼 값이 바로 아래 대화에 반영된다
+            profile_note = f"[현재 신체 정보: 키 {h}cm, 몸무게 {w}kg, BMI {bmi_v:.1f}]"
             nutri_text = ", ".join(f"{k} {v:g}" for k, v in nutrients.items() if k in ["탄수화물", "단백질", "지방", "나트륨"])
 
             system_prompt = f"""너는 고등학생 전담 '개인 트레이너'야. 말투는 츤데레처럼 잔소리가 많지만 속은 따뜻해.
@@ -446,6 +553,7 @@ if "rows" in st.session_state:
 - 오늘 중식 메뉴: {menu}
 - 오늘 중식 칼로리: {kcal:.0f} Kcal
 - 영양소(g, mg): {nutri_text}
+- 이번 주 월요일부터 누적 중식 칼로리: {week_total:.0f} Kcal (주간 기준 {WEEKLY_GOAL} Kcal)
 - 키 {h}cm, 몸무게 {w}kg, BMI {bmi_v:.1f}
 안전 규칙: 굶기, 구토, 약물, 극단적 절식은 절대 권하지 마. 외모나 몸을 비하하지 마.
 BMI가 18.5 미만이면 살을 빼라고 하지 말고 균형 잡힌 식사를 권해.
@@ -459,8 +567,8 @@ BMI가 18.5 미만이면 살을 빼라고 하지 말고 균형 잡힌 식사를 
 
             pending = None  # 이번 실행에서 새로 보낸 말
             col_a, col_b = st.columns([3, 1])
-            if col_a.button("📣 오늘 급식 잔소리 듣기", use_container_width=True, type="primary"):
-                pending = "오늘 급식 먹은 거 보고 잔소리해줘!"
+            if col_a.button("📣 급식 잔소리 듣기", use_container_width=True, type="primary"):
+                pending = "급식 먹은 거 보고 잔소리해줘!"
             if col_b.button("🗑️ 대화 지우기", use_container_width=True):
                 st.session_state["chat"] = []
                 st.rerun()
@@ -483,6 +591,6 @@ BMI가 18.5 미만이면 살을 빼라고 하지 말고 균형 잡힌 식사를 
             if pending:
                 with st.chat_message("assistant", avatar="💪"):
                     with st.spinner("트레이너가 생각 중..."):
-                        reply = ask_trainer(system_prompt, st.session_state["chat"])
+                        reply = ask_trainer(system_prompt, st.session_state["chat"], profile_note)
                     st.markdown(format_reply(reply))
                 st.session_state["chat"].append({"role": "assistant", "content": reply})
